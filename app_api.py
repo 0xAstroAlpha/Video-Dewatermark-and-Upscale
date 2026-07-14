@@ -1,42 +1,143 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from contextlib import asynccontextmanager
+import asyncio
 import shutil
 import os
+import re
 import uuid
 import json
+import time
 import logging
+import subprocess
+from urllib.parse import unquote
 from process_with_template import detect_profile, process_dewatermark
 from upscale_video import upscale_video
 
-# Configure logging so detect_profile print()s and errors appear in Uvicorn console
-logging.basicConfig(level=logging.INFO)
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MB hard limit
+PROCESS_TIMEOUT_SEC = 600             # 10-minute ProPainter timeout
+TEMP_DIR = "temp_uploads"
+FRAMES_DIR = "extracted_frames"
+
+# GPU semaphore — only 1 job runs on GPU at a time; others queue
+_gpu_semaphore = asyncio.Semaphore(1)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S"
+)
 logger = logging.getLogger("video_api")
 
-# Create directories
-os.makedirs("temp_uploads", exist_ok=True)
-os.makedirs("extracted_frames", exist_ok=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# STARTUP / SHUTDOWN LIFECYCLE
+# ─────────────────────────────────────────────────────────────────────────────
+def _startup_cleanup():
+    """Remove stale temp files and orphaned ProPainter result dirs on startup."""
+    # Clean temp_uploads older than 1 hour
+    if os.path.isdir(TEMP_DIR):
+        cutoff = time.time() - 3600
+        for f in os.listdir(TEMP_DIR):
+            fp = os.path.join(TEMP_DIR, f)
+            try:
+                if os.path.getmtime(fp) < cutoff:
+                    os.remove(fp)
+                    logger.info(f"[Startup Cleanup] Removed stale temp: {f}")
+            except Exception:
+                pass
+    # Clean orphaned ProPainter results dirs
+    propainter_dir = os.path.abspath("ProPainter")
+    if os.path.isdir(propainter_dir):
+        for d in os.listdir(propainter_dir):
+            if d.startswith("results_run_"):
+                dp = os.path.join(propainter_dir, d)
+                try:
+                    shutil.rmtree(dp)
+                    logger.info(f"[Startup Cleanup] Removed orphaned ProPainter dir: {d}")
+                except Exception:
+                    pass
 
+def _check_ffmpeg():
+    """Warn if ffmpeg is not available in PATH."""
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        logger.info("[Startup] ffmpeg found in PATH ✓")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        logger.warning("[Startup] WARNING: ffmpeg NOT found in PATH! Audio merge will fail.")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # On startup
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    os.makedirs(FRAMES_DIR, exist_ok=True)
+    _startup_cleanup()
+    _check_ffmpeg()
+    logger.info("[Startup] Video Dewatermark & Upscale API ready on port 8288")
+    yield
+    # On shutdown — nothing special needed
+
+# ─────────────────────────────────────────────────────────────────────────────
+# APP + CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Video Process API",
     description="Local HTTP API for automated ProPainter dewatermarking and Real-ESRGAN upscaling.",
-    version="1.0.0"
+    version="2.0.0",
+    lifespan=lifespan
 )
 
-# Load configuration once on startup
+# Load watermark templates once
 with open("watermark_templates.json", "r") as f:
     config = json.load(f)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def _sanitize_filename(name: str) -> str:
+    """Decode URL encoding and strip unsafe characters to prevent path traversal."""
+    name = unquote(name)
+    name = os.path.basename(name)  # strip any directory component
+    name = re.sub(r'[^\w\-. ]', '_', name)  # keep safe chars only
+    return name.strip() or "upload"
+
+def _validate_video(path: str) -> tuple[bool, str]:
+    """Return (ok, error_message). Checks file is a readable video with frames."""
+    import cv2
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return False, "File is not a valid video or is corrupted."
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    if frame_count <= 0:
+        return False, f"Video has 0 frames (frame_count={frame_count})."
+    if fps <= 0:
+        return False, f"Video has invalid FPS ({fps})."
+    return True, ""
+
 def cleanup_files(file_paths: list):
+    """Delete a list of files safely — used as a BackgroundTask after response sent."""
     for path in file_paths:
         if path and os.path.exists(path):
             try:
                 os.remove(path)
-                print(f"[API Cleanup] Deleted: {path}")
+                logger.info(f"[Cleanup] Deleted: {path}")
             except Exception as e:
-                print(f"[API Cleanup] Error deleting {path}: {e}")
+                logger.warning(f"[Cleanup] Could not delete {path}: {e}")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN ENDPOINT
+# ─────────────────────────────────────────────────────────────────────────────
 @app.post("/process")
-def process_video_endpoint(
+async def process_video_endpoint(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     profile: str = Form(None),
@@ -44,85 +145,148 @@ def process_video_endpoint(
     upscale_model: str = Form("realesr-animevideov3"),
     target_resolution: str = Form("1080p")
 ):
-    # 1. Generate unique file IDs
     req_id = str(uuid.uuid4())
-    from urllib.parse import unquote
-    safe_filename = unquote(file.filename)  # decode URL encoding e.g. %20 -> space
+    short_id = req_id[:8]
+
+    # ── 1. File size pre-check ────────────────────────────────────────────────
+    content_length = file.size  # FastAPI sets this from Content-Length
+    if content_length and content_length > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large: {content_length / 1e6:.1f} MB. Maximum is {MAX_UPLOAD_BYTES // 1024 // 1024} MB."
+        )
+
+    # ── 2. Save uploaded file ─────────────────────────────────────────────────
+    safe_filename = _sanitize_filename(file.filename or "upload.mp4")
     input_filename = f"input_{req_id}_{safe_filename}"
-    input_path = os.path.join("temp_uploads", input_filename)
-    
-    # Save uploaded file
+    input_path = os.path.join(TEMP_DIR, input_filename)
+
     try:
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save upload: {str(e)}")
-        
+        raise HTTPException(status_code=500, detail=f"Failed to save upload: {e}")
+
+    # Enforce size limit again after full write (in case Content-Length was missing)
+    actual_size = os.path.getsize(input_path)
+    if actual_size > MAX_UPLOAD_BYTES:
+        os.remove(input_path)
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large after upload: {actual_size / 1e6:.1f} MB. Maximum is {MAX_UPLOAD_BYTES // 1024 // 1024} MB."
+        )
+
     files_to_clean = [input_path]
-    
-    # 2. Match watermark profile
+    logger.info(f"[{short_id}] Received: '{safe_filename}' ({actual_size / 1e6:.1f} MB) | profile={profile} upscale={upscale}")
+
+    # ── 3. Validate video ─────────────────────────────────────────────────────
+    valid, err_msg = _validate_video(input_path)
+    if not valid:
+        cleanup_files(files_to_clean)
+        raise HTTPException(status_code=400, detail=f"Invalid video file: {err_msg}")
+
+    # ── 4. Profile detection ──────────────────────────────────────────────────
     profile_key = profile
-    logger.info(f"[Request {req_id[:8]}] File: {file.filename}, Profile param: {profile}, Upscale: {upscale}")
-    
     if not profile_key or profile_key == "auto":
-        logger.info(f"[Request {req_id[:8]}] Running auto-detection on {input_path}...")
+        logger.info(f"[{short_id}] Running auto-detection...")
         profile_key = detect_profile(input_path, config)
-        logger.info(f"[Request {req_id[:8]}] Auto-detection result: {profile_key}")
-        
+        logger.info(f"[{short_id}] Auto-detection result: {profile_key}")
+
     if not profile_key:
         cleanup_files(files_to_clean)
         raise HTTPException(
-            status_code=400, 
-            detail=f"Auto-detection failed for '{file.filename}'. No watermark template matched above threshold. Try specifying a profile manually (dola_ai_bottom_right / veo_bottom_right_format / gemini_omni_format)."
+            status_code=400,
+            detail=(
+                f"Auto-detection failed for '{safe_filename}'. "
+                f"No watermark template matched. "
+                f"Specify profile manually: {list(config.keys())}"
+            )
         )
-        
+
     if profile_key not in config:
         cleanup_files(files_to_clean)
         raise HTTPException(
             status_code=400,
-            detail=f"Profile '{profile_key}' does not exist in templates configuration. Valid options: {list(config.keys())}"
+            detail=f"Unknown profile '{profile_key}'. Valid options: {list(config.keys())}"
         )
-        
-    # 3. Process Watermark Removal
+
+    # ── 5. GPU-locked processing (semaphore) ──────────────────────────────────
     dewatermarked_filename = f"clean_{req_id}.mp4"
-    dewatermarked_path = os.path.join("temp_uploads", dewatermarked_filename)
-    
-    print(f"\n[API] Running dewatermarking for profile: {profile_key}...")
-    clean_result = process_dewatermark(input_path, profile_key, config, output_path=dewatermarked_path)
-    
+    dewatermarked_path = os.path.join(TEMP_DIR, dewatermarked_filename)
+
+    logger.info(f"[{short_id}] Waiting for GPU slot...")
+    async with _gpu_semaphore:
+        logger.info(f"[{short_id}] GPU slot acquired. Processing profile: {profile_key}")
+        try:
+            # Run blocking CPU/GPU work in a thread so the event loop stays alive
+            loop = asyncio.get_event_loop()
+            clean_result = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: process_dewatermark(
+                    input_path, profile_key, config, output_path=dewatermarked_path
+                )),
+                timeout=PROCESS_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError:
+            cleanup_files(files_to_clean)
+            raise HTTPException(
+                status_code=504,
+                detail=f"Processing timed out after {PROCESS_TIMEOUT_SEC // 60} minutes. Video may be too long."
+            )
+        except Exception as e:
+            logger.error(f"[{short_id}] Dewatermark exception: {e}", exc_info=True)
+            cleanup_files(files_to_clean)
+            raise HTTPException(status_code=500, detail=f"Watermark removal failed: {e}")
+
     if not clean_result or not os.path.exists(dewatermarked_path):
         cleanup_files(files_to_clean)
-        raise HTTPException(status_code=500, detail="Watermark removal processing failed.")
-        
+        raise HTTPException(
+            status_code=500,
+            detail="ProPainter produced no output. Check server logs for details."
+        )
+
     files_to_clean.append(dewatermarked_path)
     final_output_path = dewatermarked_path
-    
-    # 4. Optional Upscale Stage
+    logger.info(f"[{short_id}] Dewatermarking complete.")
+
+    # ── 6. Optional upscale ───────────────────────────────────────────────────
     if upscale:
-        print(f"\n[API] Running upscaling with model: {upscale_model}...")
+        logger.info(f"[{short_id}] Running upscale with model: {upscale_model}")
         try:
-            upscale_result = upscale_video(dewatermarked_path, upscale_model, target_resolution)
+            upscale_result = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: upscale_video(dewatermarked_path, upscale_model, target_resolution)
+            )
             if upscale_result and os.path.exists(upscale_result):
                 final_output_path = upscale_result
-                files_to_clean.append(final_output_path)
+                files_to_clean.append(upscale_result)
+                logger.info(f"[{short_id}] Upscale complete: {upscale_result}")
             else:
-                print("[API Warning] Upscale failed, falling back to clean dewatermarked video.")
+                logger.warning(f"[{short_id}] Upscale produced no output; returning clean video without upscale.")
         except Exception as e:
-            print(f"[API Error] Upscale exception: {str(e)}")
-            
-    # 5. Serve response and register cleanup task
+            logger.error(f"[{short_id}] Upscale failed: {e}")
+            # Non-fatal: fall back to the dewatermarked video
+
+    # ── 7. Return file & schedule cleanup ─────────────────────────────────────
+    download_name = f"upscaled_{target_resolution}_{safe_filename}" if upscale else f"clean_{safe_filename}"
     background_tasks.add_task(cleanup_files, files_to_clean)
-    
-    # Return file with clean download name
-    download_name = f"clean_{file.filename}"
-    if upscale:
-        download_name = f"upscaled_{target_resolution}_{file.filename}"
-        
+    logger.info(f"[{short_id}] Sending response: {download_name}")
+
     return FileResponse(
-        path=final_output_path, 
+        path=final_output_path,
         media_type="video/mp4",
         filename=download_name
     )
+
+
+@app.get("/health")
+def health_check():
+    """Simple health check endpoint — returns queue depth and config info."""
+    return {
+        "status": "ok",
+        "gpu_slots_available": _gpu_semaphore._value,
+        "profiles": list(config.keys()),
+        "max_upload_mb": MAX_UPLOAD_BYTES // 1024 // 1024,
+        "process_timeout_sec": PROCESS_TIMEOUT_SEC,
+    }
 
 @app.get("/", response_class=HTMLResponse)
 def get_web_ui():
