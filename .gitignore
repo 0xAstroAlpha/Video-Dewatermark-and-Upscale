@@ -1,0 +1,37 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints
+.pytest_cache/
+
+# Large Model Weights (RAFT, ProPainter, Real-ESRGAN, etc.)
+*.pth
+*.onnx
+ProPainter/weights/
+weights/
+gfpgan/weights/
+experiments/
+
+# Video files (Inputs, clean outputs, intermediates)
+*.mp4
+*.avi
+*.mkv
+ProPainter/results*/
+ProPainter/temp*/
+extracted_frames/video*_mean.png
+extracted_frames/video*_std.png
+extracted_frames/video*_first_frame.png
+extracted_frames/video*_detected_bbox.png
+extracted_frames/veo_grid_zoomed.png
+extracted_frames/veo_adaptive_thresh.png
+extracted_frames/propainter_*grid.png
+extracted_frames/upscale_comparison_grid.png
+extracted_frames/comparison_grid.png
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

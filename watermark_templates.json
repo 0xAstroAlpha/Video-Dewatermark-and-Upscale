@@ -1,0 +1,110 @@
+{
+  "dola_ai_bottom_right": {
+    "name": "Dola AI Watermark (Option 3C Sweet Spot)",
+    "description": "White text watermark 'Dola AI' at the bottom-right corner of the video. Runs at 10+ FPS using Option 3C crop.",
+    "video_resolution": [
+      1280,
+      720
+    ],
+    "watermarks": [
+      {
+        "position": "bottom_right",
+        "watermark_bbox": [
+          1080,
+          610,
+          200,
+          100
+        ],
+        "crop_bbox": [
+          960,
+          560,
+          320,
+          160
+        ],
+        "mask_method": "color_threshold",
+        "mask_params": {
+          "lower_bright": 200,
+          "dilation_iter": 4
+        },
+        "model_params": {
+          "raft_iter": 8,
+          "ref_stride": 20,
+          "neighbor_length": 6
+        },
+        "template_image": "extracted_frames/dola_ai_template.png"
+      }
+    ]
+  },
+  "veo_bottom_right_format": {
+    "name": "Veo Watermark (Video 1 Layout)",
+    "description": "Translucent watermark 'Veo' at the bottom-right corner of the video.",
+    "video_resolution": [
+      1280,
+      720
+    ],
+    "watermarks": [
+      {
+        "position": "bottom_right",
+        "watermark_bbox": [
+          1222,
+          680,
+          42,
+          40
+        ],
+        "crop_bbox": [
+          1040,
+          560,
+          240,
+          160
+        ],
+        "mask_method": "color_threshold",
+        "mask_params": {
+          "lower_bright": 100,
+          "dilation_iter": 4
+        },
+        "model_params": {
+          "raft_iter": 8,
+          "ref_stride": 20,
+          "neighbor_length": 6
+        },
+        "template_image": "extracted_frames/video1_bottom_right_template.png"
+      }
+    ]
+  },
+  "short_video_logo_format": {
+    "name": "Short Video Platform Logo (Video 2 Layout - HQ Motion Profile)",
+    "description": "Small vertical logo at the bottom-right corner, typical of short video platforms (TikTok, Kwai, etc.). Uses dense tracking iterations to handle fast camera motion.",
+    "video_resolution": [
+      1280,
+      720
+    ],
+    "watermarks": [
+      {
+        "position": "bottom_right",
+        "watermark_bbox": [
+          1140,
+          573,
+          40,
+          54
+        ],
+        "crop_bbox": [
+          960,
+          480,
+          320,
+          240
+        ],
+        "mask_method": "color_threshold",
+        "mask_params": {
+          "lower_bright": 160,
+          "dilation_iter": 4
+        },
+        "model_params": {
+          "raft_iter": 20,
+          "ref_stride": 10,
+          "neighbor_length": 10
+        },
+        "template_image": "extracted_frames/video2_bottom_right_template.png"
+      }
+    ]
+  }
+}
