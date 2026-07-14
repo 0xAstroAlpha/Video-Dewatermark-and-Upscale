@@ -102,11 +102,13 @@ def generate_local_mask(crop_frame, wm_bbox, crop_bbox, mask_params):
     
     return dilated
 
-def process_dewatermark(video_path, profile_key, templates_config):
+def process_dewatermark(video_path, profile_key, templates_config, output_path=None):
     profile = templates_config[profile_key]
     print(f"\nProcessing video: {video_path}")
     print(f"Profile: {profile['name']}")
     
+    # Generate unique identifier from input filename
+    base_name = os.path.splitext(os.path.basename(video_path))[0]
     current_video_source = video_path
     
     # We will process each watermark sequentially
@@ -116,10 +118,10 @@ def process_dewatermark(video_path, profile_key, templates_config):
         # Bounding boxes
         x_c, y_c, w_c, h_c = wm["crop_bbox"]
         
-        temp_crop_video = f"temp_crop_run.mp4"
-        temp_mask_png = f"extracted_frames/temp_mask_run.png"
-        temp_overlay_video = f"temp_overlay_run.mp4"
-        next_source_video = f"temp_source_step_{idx}.mp4" if idx < len(profile["watermarks"]) - 1 else "output_clean_templated.mp4"
+        temp_crop_video = f"temp_crop_{base_name}.mp4"
+        temp_mask_png = f"extracted_frames/temp_mask_{base_name}.png"
+        temp_overlay_video = f"temp_overlay_{base_name}.mp4"
+        next_source_video = f"temp_source_step_{idx}_{base_name}.mp4" if idx < len(profile["watermarks"]) - 1 else (output_path or f"output_clean_{base_name}.mp4")
         
         # 1. Read source and crop target area, generating local mask frame-by-frame
         cap = cv2.VideoCapture(current_video_source)
@@ -127,13 +129,11 @@ def process_dewatermark(video_path, profile_key, templates_config):
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out_crop = cv2.VideoWriter(temp_crop_video, fourcc, fps, (w_c, h_c))
         
-        # We need a static mask (ProPainter takes a single image if it is static)
-        # We'll calculate the dynamic mask for the first frame as the static mask template
         ret, first_frame = cap.read()
         if not ret:
             print("Failed to read video.")
             cap.release()
-            return
+            return None
             
         first_crop = first_frame[y_c:y_c+h_c, x_c:x_c+w_c]
         mask_dilated = generate_local_mask(first_crop, wm["watermark_bbox"], wm["crop_bbox"], wm["mask_params"])
@@ -153,11 +153,12 @@ def process_dewatermark(video_path, profile_key, templates_config):
         
         # 2. Run ProPainter on the crop
         propainter_dir = os.path.abspath("ProPainter")
+        results_dir_name = f"results_run_{base_name}"
         cmd = [
             "python", "inference_propainter.py",
             "--video", f"../{temp_crop_video}",
             "--mask", f"../{temp_mask_png}",
-            "--output", f"results_run",
+            "--output", results_dir_name,
             "--subvideo_length", "40",
             "--raft_iter", str(wm["model_params"]["raft_iter"]),
             "--ref_stride", str(wm["model_params"]["ref_stride"]),
@@ -177,12 +178,12 @@ def process_dewatermark(video_path, profile_key, templates_config):
         if result.returncode != 0:
             print("Error: ProPainter execution failed!")
             print("Stderr:", result.stderr.decode('utf-8', errors='replace'))
-            return
+            return None
             
-        propainter_out_file = os.path.join(propainter_dir, "results_run", "temp_crop_run", "inpaint_out.mp4")
+        propainter_out_file = os.path.join(propainter_dir, results_dir_name, f"temp_crop_{base_name}", "inpaint_out.mp4")
         if not os.path.exists(propainter_out_file):
             print("Error: ProPainter output not found.")
-            return
+            return None
             
         # 3. Overlay back
         print("Overlaying back onto original frames...")
@@ -229,6 +230,11 @@ def process_dewatermark(video_path, profile_key, templates_config):
         if os.path.exists(temp_crop_video): os.remove(temp_crop_video)
         if os.path.exists(temp_mask_png): os.remove(temp_mask_png)
         if os.path.exists(temp_overlay_video): os.remove(temp_overlay_video)
+        
+        # Cleanup ProPainter output dir
+        results_dir_path = os.path.join(propainter_dir, results_dir_name)
+        if os.path.exists(results_dir_path):
+            shutil.rmtree(results_dir_path)
         
         # If there was a previous step file, clean it up
         if idx > 0 and os.path.exists(current_video_source) and "temp_source_step_" in current_video_source:
