@@ -4,8 +4,13 @@ import shutil
 import os
 import uuid
 import json
+import logging
 from process_with_template import detect_profile, process_dewatermark
 from upscale_video import upscale_video
+
+# Configure logging so detect_profile print()s and errors appear in Uvicorn console
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("video_api")
 
 # Create directories
 os.makedirs("temp_uploads", exist_ok=True)
@@ -55,21 +60,25 @@ def process_video_endpoint(
     
     # 2. Match watermark profile
     profile_key = profile
+    logger.info(f"[Request {req_id[:8]}] File: {file.filename}, Profile param: {profile}, Upscale: {upscale}")
+    
     if not profile_key or profile_key == "auto":
+        logger.info(f"[Request {req_id[:8]}] Running auto-detection on {input_path}...")
         profile_key = detect_profile(input_path, config)
+        logger.info(f"[Request {req_id[:8]}] Auto-detection result: {profile_key}")
         
     if not profile_key:
         cleanup_files(files_to_clean)
         raise HTTPException(
             status_code=400, 
-            detail="No matching watermark profile found. Please select a template manually."
+            detail=f"Auto-detection failed for '{file.filename}'. No watermark template matched above threshold. Try specifying a profile manually (dola_ai_bottom_right / veo_bottom_right_format / gemini_omni_format)."
         )
         
     if profile_key not in config:
         cleanup_files(files_to_clean)
         raise HTTPException(
             status_code=400,
-            detail=f"Selected profile '{profile_key}' does not exist in templates configuration."
+            detail=f"Profile '{profile_key}' does not exist in templates configuration. Valid options: {list(config.keys())}"
         )
         
     # 3. Process Watermark Removal

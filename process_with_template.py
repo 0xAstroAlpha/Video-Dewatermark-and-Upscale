@@ -7,10 +7,12 @@ import json
 import time
 import subprocess
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+# Only override stdout when running as script (not when imported by FastAPI)
+if __name__ == "__main__":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-def detect_profile(video_path, templates_config):
+def detect_profile(video_path, templates_config, min_score=0.60, fallback_to_best=True):
     cap = cv2.VideoCapture(video_path)
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
@@ -67,15 +69,21 @@ def detect_profile(video_path, templates_config):
                     best_frame_score = max_val
                     
             print(f"  - Matching '{profile_key}' ({wm['position']}): Max Score = {best_frame_score:.3f}")
-            if best_frame_score > 0.80 and best_frame_score > max_val_found:
+            if best_frame_score > max_val_found:
+                max_val_found = best_frame_score
+                best_candidate = profile_key
+            if best_frame_score >= min_score and best_frame_score > (max_val_found if best_match else 0):
                 max_val_found = best_frame_score
                 best_match = profile_key
                 
     if best_match:
         print(f"-> SUCCESS: Matched profile '{best_match}' with score {max_val_found:.3f}")
         return best_match
+    elif fallback_to_best and best_candidate:
+        print(f"-> FALLBACK: No profile above {min_score:.0%} threshold. Using best candidate '{best_candidate}' (score={max_val_found:.3f})")
+        return best_candidate
     else:
-        print("-> WARNING: No matching watermark profile found.")
+        print(f"-> WARNING: No matching watermark profile found (best score was {max_val_found:.3f}).")
         return None
 
 def generate_local_mask(crop_frame, wm_bbox, crop_bbox, mask_params):
