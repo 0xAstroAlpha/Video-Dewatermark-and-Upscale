@@ -355,7 +355,7 @@ def get_web_ui():
                         <option value="auto">Tự động nhận diện (Auto-Detect)</option>
                         <option value="dola_ai_bottom_right">Dola AI (Bottom-Right, 720p)</option>
                         <option value="veo_bottom_right_format">Veo Watermark (Bottom-Right, Video 1)</option>
-                        <option value="short_video_logo_format">Platform Logo (Bottom-Right, Video 2 HQ)</option>
+                        <option value="gemini_omni_format">Gemini Omni Logo (Bottom-Right, Video 2 HQ)</option>
                     </select>
                 </div>
                 
