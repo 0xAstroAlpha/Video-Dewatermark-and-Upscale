@@ -6,6 +6,7 @@ import io
 import json
 import time
 import subprocess
+import shutil
 
 # Only override stdout when running as script (not when imported by FastAPI)
 if __name__ == "__main__":

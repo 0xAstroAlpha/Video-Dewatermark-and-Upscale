@@ -46,7 +46,9 @@ def process_video_endpoint(
 ):
     # 1. Generate unique file IDs
     req_id = str(uuid.uuid4())
-    input_filename = f"input_{req_id}_{file.filename}"
+    from urllib.parse import unquote
+    safe_filename = unquote(file.filename)  # decode URL encoding e.g. %20 -> space
+    input_filename = f"input_{req_id}_{safe_filename}"
     input_path = os.path.join("temp_uploads", input_filename)
     
     # Save uploaded file
